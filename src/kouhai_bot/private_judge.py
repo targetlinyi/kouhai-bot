@@ -21,6 +21,7 @@ from .handlers.shared import (
     atomic_write_json,
     build_problem_card_nodes,
     build_problem_card_legacy_segments,
+    build_problem_diagram_messages,
     get_problem_summary,
     get_today_problem,
     high_difficulty_notice,
@@ -563,7 +564,6 @@ async def build_problem_card_payload(group_id: int, problem: dict, *, greeting: 
             on_translate_exception="source",
             log_context="private judge",
         ),
-        "snake_enabled": False,
     }
 
 
@@ -647,11 +647,12 @@ async def send_problem_card_private(user_id: int, group_id: int, problem: dict, 
         notes_message = ""
 
     bot_name = await resolve_bot_display_name(None)
+    diagram_messages = await build_problem_diagram_messages(pid)
     nodes = build_problem_card_nodes(
         post_msg=post_msg,
         sample_messages=[str(item) for item in sample_messages],
         notes_message=notes_message,
-        snake_enabled=bool(payload.get("snake_enabled")),
+        diagram_messages=diagram_messages,
         bot_qq=cfg.bot_qq,
         bot_name=bot_name,
     )
@@ -659,7 +660,7 @@ async def send_problem_card_private(user_id: int, group_id: int, problem: dict, 
         destination="private", user_id=user_id, nodes=nodes,
         self_send_messages=build_problem_card_legacy_segments(
             post_msg=post_msg, sample_messages=[str(item) for item in sample_messages],
-            notes_message=notes_message, snake_enabled=bool(payload.get("snake_enabled")),
+            notes_message=notes_message, diagram_messages=diagram_messages,
         ),
     )
     if fwd_resp:
@@ -668,13 +669,23 @@ async def send_problem_card_private(user_id: int, group_id: int, problem: dict, 
         return True
 
     direct_id = await send_private_msg(user_id, build_plain_message(post_msg))
+    if not direct_id:
+        return False
     _save_private_problem_card_ref(group_id, direct_id, pid)
-    for sample in sample_messages:
-        sample_id = await send_private_msg(user_id, build_plain_message(str(sample)))
-        _save_private_problem_card_ref(group_id, sample_id, pid)
-    if notes_message:
-        notes_id = await send_private_msg(user_id, build_plain_message(notes_message))
-        _save_private_problem_card_ref(group_id, notes_id, pid)
+    incomplete = False
+    for message in build_problem_card_legacy_segments(
+        post_msg=post_msg, sample_messages=[str(item) for item in sample_messages],
+        notes_message=notes_message, diagram_messages=diagram_messages,
+    )[1:]:
+        component_id = await send_private_msg(user_id, message)
+        _save_private_problem_card_ref(group_id, component_id, pid)
+        if not component_id:
+            incomplete = True
+    if incomplete:
+        logger.warning("private problem-card components failed to send for %s", pid)
+        await send_private_msg(user_id, build_plain_message(
+            "部分题面内容发送失败，可稍后用 /pb 重试。"
+        ))
     await _send_high_difficulty_notice_private(user_id, problem)
     return True
 

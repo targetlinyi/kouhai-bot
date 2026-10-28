@@ -49,6 +49,19 @@ def statement_images(statement: object) -> list[dict]:
     ]
 
 
+def statement_diagrams(statement: object) -> list[dict]:
+    """Select original statement diagrams in source order, excluding formulas."""
+    return [
+        image
+        for image in statement_images(statement)
+        if image.get("kind") == "graphic"
+        or (
+            not image.get("kind")
+            and "tex-graphics" in str(image.get("class", "")).split()
+        )
+    ]
+
+
 def format_problem_statement_for_llm(statement: object) -> str:
     """Format one cached statement as stable LLM grounding text."""
     if not isinstance(statement, dict):

@@ -24,6 +24,7 @@ from ..llm import ChatCompletionResult, append_model_tag, chat_completion, strip
 from ..problem_content import (
     format_problem_statement_for_llm,
     load_statement_json,
+    statement_diagrams,
     statement_fingerprint,
     statement_images,
 )
@@ -541,16 +542,33 @@ def save_problem_summary(
 
 # Legacy id-based card fields: cards are rebuilt from content as custom
 # nodes, so these are dropped unconditionally instead of ever being replayed.
-_LEGACY_CARD_ID_KEYS = ("msg_id", "sample_msg_ids", "note_msg_id", "snake_msg_id", "fwd_message_id")
+_LEGACY_CARD_ID_KEYS = ("msg_id", "sample_msg_ids", "note_msg_id", "snake_msg_id", "fwd_message_id", "snake_enabled")
 
 
-def snake_image_path() -> str:
-    """Path of the repo-root ``snake_trio.jpg``.
+async def build_problem_diagram_messages(pid: str) -> list[list[dict]]:
+    """Load this problem's original diagrams once for all QQ delivery paths."""
+    from ..napcat.client import build_text
 
-    Located like ``judge_prompt.txt`` (repo root, three levels above this
-    module). A missing file simply means no snake node.
-    """
-    return os.path.join(os.path.dirname(__file__), "..", "..", "..", "snake_trio.jpg")
+    images = statement_diagrams(load_statement_json(pid, include_legacy_fallback=True))
+
+    async def build_message(idx: int, image: dict) -> list[dict]:
+        caption = f"题目示意图 {idx}"
+        try:
+            data_url = await _download_image_data_url_async(image["src"])
+            header, encoded = data_url.split(",", 1)
+            if not header.startswith("data:image/") or not header.endswith(";base64") or not encoded:
+                raise ValueError("invalid image data URL")
+        except Exception as exc:
+            logger.warning("[%s] Diagram %s unavailable: %s", pid, idx, exc)
+            return [build_text(f"{caption} 暂时加载失败，可稍后用 /pb 重试。")]
+        return [
+            build_text(caption),
+            {"type": "image", "data": {"file": f"base64://{encoded}"}},
+        ]
+
+    return list(await asyncio.gather(*[
+        build_message(idx, image) for idx, image in enumerate(images, 1)
+    ]))
 
 
 def build_problem_card_nodes(
@@ -558,56 +576,29 @@ def build_problem_card_nodes(
     post_msg: str,
     sample_messages: list[str],
     notes_message: str = "",
-    snake_enabled: bool = True,
+    diagram_messages: list[list[dict]] | None = None,
     bot_qq: int,
     bot_name: str = "",
 ) -> list[dict]:
     """Assemble a problem card as sender-attributed merged-forward nodes.
 
-    One node per component — greeting/summary text, one per sample, the
-    optional translated notes, then the snake image (base64, so NapCat needs
-    no access to repo paths). No self-send: a single ``send_*_forward_msg``
-    call publishes the whole card.
+    One node per component: summary, samples, optional notes, then original
+    diagrams. Image bytes are embedded so Docker needs no host-file access.
     """
-    from ..napcat.client import build_node, build_text
+    from ..napcat.client import build_node
 
-    nodes = [
-        build_node(user_id=bot_qq, nickname=bot_name, content=[build_text(post_msg)]),
+    return [
+        build_node(user_id=bot_qq, nickname=bot_name, content=message)
+        for message in build_problem_card_legacy_segments(
+            post_msg=post_msg, sample_messages=sample_messages,
+            notes_message=notes_message, diagram_messages=diagram_messages,
+        )
     ]
-    for sample in sample_messages:
-        nodes.append(
-            build_node(
-                user_id=bot_qq,
-                nickname=bot_name,
-                content=[build_text(str(sample))],
-            )
-        )
-    if notes_message:
-        nodes.append(
-            build_node(user_id=bot_qq, nickname=bot_name, content=[build_text(notes_message)])
-        )
-    if snake_enabled:
-        snake_path = snake_image_path()
-        if os.path.exists(snake_path):
-            try:
-                with open(snake_path, "rb") as f:
-                    encoded = base64.b64encode(f.read()).decode()
-                nodes.append(
-                    build_node(
-                        user_id=bot_qq,
-                        nickname=bot_name,
-                        content=[
-                            {"type": "image", "data": {"file": f"base64://{encoded}"}}
-                        ],
-                    )
-                )
-            except Exception as exc:
-                logger.warning("snake image node skipped: %s", exc)
-    return nodes
 
 
 def build_problem_card_legacy_segments(
-    *, post_msg: str, sample_messages: list[str], notes_message: str = "", snake_enabled: bool = True,
+    *, post_msg: str, sample_messages: list[str], notes_message: str = "",
+    diagram_messages: list[list[dict]] | None = None,
 ) -> list[list[dict]]:
     """Build the pre-custom-node card content for self-send/id forwarding."""
     from ..napcat.client import build_plain_message
@@ -616,15 +607,7 @@ def build_problem_card_legacy_segments(
     messages.extend(build_plain_message(str(sample)) for sample in sample_messages)
     if notes_message:
         messages.append(build_plain_message(notes_message))
-    if snake_enabled:
-        snake_path = snake_image_path()
-        if os.path.exists(snake_path):
-            try:
-                with open(snake_path, "rb") as f:
-                    encoded = base64.b64encode(f.read()).decode()
-                messages.append([{"type": "image", "data": {"file": f"base64://{encoded}"}}])
-            except Exception as exc:
-                logger.warning("snake image legacy segment skipped: %s", exc)
+    messages.extend(diagram_messages or [])
     return messages
 
 
