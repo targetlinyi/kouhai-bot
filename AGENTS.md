@@ -57,6 +57,7 @@ NapCat (QQ) ──WS──> worker.py
   only as fallback.
 - **Scheduler current-group config**: `~/.kouhai-bot/scheduler_config.json` stores job list + time overrides for `CURRENT_GROUP`. Jobs are defined in `scheduler/jobs.py`.
 - **Multimodal statements**: `problems/fetcher.py` collects CF `tex-formula` and `tex-graphics` image metadata with statement text. Formula images and diagrams are attached to new-problem summary and `/clarify` requests, which route through `llm.general_model` like every other non-judge task; those providers must therefore accept image inputs. (A legacy `llm.multimodal_model` config section is deduplicated by name and appended to the general queue with a warning.)
+- **Problem-card diagrams**: Group and private problem cards attach the current problem's original `graphic` images in source order, loaded by pid from its statement cache. Formula images stay in LLM context only. Diagram bytes are sent as OneBot base64 images for Docker compatibility; a failed download produces a `/pb` retry notice without dropping other content. Cards never append the fixed mascot. Legacy `snake_enabled` and node-id fields are discarded when rebuilding cached cards.
 - **Unified CF HTML transport**: `problems/cf_fetcher.py` is the single transport for
   Codeforces problem statement and blog HTML. It tries `cloudscraper` first and falls
   back to headless Playwright Chromium after HTTP 403, timeout/connection failure,
@@ -498,7 +499,7 @@ Persistence and derived surfaces (all user-visible LLM output carries the tag):
 ```
 groups/<gid>/state.json      # today's problem (+ posted_at unix ts when card was delivered)
 groups/<gid>/scoreboard.json # cumulative {solves, user_submissions}
-groups/<gid>/daily_msg.json  # forward card payload (msg_id/sample_msg_ids/note_msg_id/snake_msg_id 等, for /problem)
+groups/<gid>/daily_msg.json  # card text/samples/notes + pid; diagrams loaded from statement on resend
 groups/<gid>/next_problem.json # source-bound durable READY slot; atomically claimed by /newproblem
 groups/<gid>/problem_summaries.json # verified, source-bound Chinese summaries keyed by pid
 groups/<gid>/used.json       # used problem IDs
@@ -843,13 +844,15 @@ newer AC can silently retarget an older review request.
    a cold start) and formats the previous-problem reveal from current state.
 4. Assemble the card as custom sender-attributed nodes — summary text; each sample as an
    independent node; a dedicated `样例解释` node when `notes` exist (with LaTeX/Markdown
-   artifacts normalized to readable symbols such as `→`, `≤`, `<`, `>`); snake image — and
+   artifacts normalized to readable symbols such as `→`, `≤`, `<`, `>`); original diagram
+   nodes loaded from the claimed pid's statement cache — and
    publish every node as one merged card with a single `send_group_forward_msg` call
 5. If delivery succeeds, commit `state.json` with `posted_at` and save `daily_msg.json`
    for `/problem` to resend. A direct-text fallback after forward-card failure still
    counts as successful delivery and must save `daily_msg.json` with `pid`, `post_msg`,
-   `sample_messages`, `notes_message`, and `snake_enabled` so `/problem` can rebuild a
-   card later. If delivery fails completely, keep the old current problem.
+   `sample_messages`, and `notes_message` so `/problem` can rebuild a card later. Direct
+   fallback also sends samples, notes, and diagrams; partial send failures produce a
+   `/pb` retry notice. If delivery fails completely, keep the old current problem.
 6. Save a successful Chinese summary to `problem_summaries.json` with its statement
    fingerprint for later verified reuse.
 7. Release the claimed slot and wake background refill. The worker's READY observer and
@@ -1158,11 +1161,11 @@ translation. Do not force synchronous translation on detail-page clicks.
 
 ### 12. `/newproblem` uses merged-forward
 `/newproblem` assembles summary text, sample nodes, the optional translated notes node,
-and the snake image as custom sender-attributed forward nodes, then publishes them as
+and the original statement diagrams as custom sender-attributed forward nodes, then publishes them as
 one merged card in a single `send_group_forward_msg` call (no self-send). `daily_msg.json`
-must persist the card CONTENT (`pid`, `post_msg`, `sample_messages`, `notes_message`,
-`snake_enabled`) so `/problem` can rebuild the same card; legacy node-id fields are never
-replayed. If merged-forward fails but direct group text succeeds, `daily_msg.json` must
+must persist the card CONTENT (`pid`, `post_msg`, `sample_messages`, `notes_message`)
+so `/problem` can rebuild the same card and reload diagrams by pid; legacy node-id and
+`snake_enabled` fields are discarded. If merged-forward fails but direct group text succeeds, `daily_msg.json` must
 still persist the current `pid` and rebuild inputs. `/problem` must ignore stale
 `daily_msg.json` whose `pid` does not match `state.json.today`.
 Complicated but essential for good UX.

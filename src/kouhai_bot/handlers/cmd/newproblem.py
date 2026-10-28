@@ -15,6 +15,7 @@ from ..registry import CommandDef
 from ..shared import (
     build_problem_card_nodes,
     build_problem_card_legacy_segments,
+    build_problem_diagram_messages,
     get_today_problem,
     high_difficulty_notice,
     is_already_solved,
@@ -235,14 +236,12 @@ def _save_daily_msg(
     post_msg: str,
     sample_messages: list[str],
     notes_message: str,
-    snake_enabled: bool,
 ) -> None:
     daily_msg = {
         "pid": pid,
         "post_msg": post_msg,
         "sample_messages": sample_messages,
         "notes_message": notes_message,
-        "snake_enabled": snake_enabled,
     }
     daily_msg_path = os.path.join(state_dir, "daily_msg.json")
     with open(daily_msg_path, "w", encoding="utf-8") as f:
@@ -254,7 +253,7 @@ async def _send_problem_forward_card(
     post_msg: str,
     sample_messages: list[str],
     notes_message: str = "",
-    snake_enabled: bool = True,
+    diagram_messages: list[list[dict]] | None = None,
 ) -> tuple[int | None, dict]:
     """Publish the problem card as a merged forward.
 
@@ -268,7 +267,7 @@ async def _send_problem_forward_card(
         post_msg=post_msg,
         sample_messages=list(sample_messages),
         notes_message=notes_message or "",
-        snake_enabled=snake_enabled,
+        diagram_messages=diagram_messages,
         bot_qq=cfg.bot_qq,
         bot_name=bot_name,
     )
@@ -276,7 +275,7 @@ async def _send_problem_forward_card(
         destination="group", group_id=group_id, nodes=nodes,
         self_send_messages=build_problem_card_legacy_segments(
             post_msg=post_msg, sample_messages=list(sample_messages),
-            notes_message=notes_message or "", snake_enabled=snake_enabled,
+            notes_message=notes_message or "", diagram_messages=diagram_messages,
         ),
     )
     return fwd_resp, {"node_count": len(nodes)}
@@ -314,6 +313,7 @@ async def _post_new_problem_locked(
         model_tag = prepared.model_tag
         sample_messages = list(prepared.sample_messages)
         notes_message = prepared.notes_message
+        diagram_messages = await build_problem_diagram_messages(pid)
 
         # Preserve the original publication-time trigger.  Normally this
         # deduplicates against preparation; after a process restart it resumes
@@ -365,7 +365,7 @@ async def _post_new_problem_locked(
             post_msg=post_msg,
             sample_messages=sample_messages,
             notes_message=notes_message,
-            snake_enabled=True,
+            diagram_messages=diagram_messages,
         )
         if not fwd_resp:
             logger.error(
@@ -389,6 +389,19 @@ async def _post_new_problem_locked(
                         )
                 return False
 
+            incomplete = False
+            for message in build_problem_card_legacy_segments(
+                post_msg=post_msg, sample_messages=sample_messages,
+                notes_message=notes_message, diagram_messages=diagram_messages,
+            )[1:]:
+                if not await send_group_msg(group_id, message):
+                    incomplete = True
+            if incomplete:
+                logger.warning("[group_%s] Some problem-card components failed to send", group_id)
+                await send_group_msg(group_id, build_plain_message(
+                    "部分题面内容发送失败，可稍后用 /pb 重试。"
+                ))
+
             await _send_high_difficulty_notice_group(group_id, picked_state)
             await _commit_problem_state(group_id, picked_state)
             try:
@@ -398,7 +411,6 @@ async def _post_new_problem_locked(
                     post_msg=post_msg,
                     sample_messages=sample_messages,
                     notes_message=notes_message,
-                    snake_enabled=True,
                 )
             except Exception as exc:
                 logger.warning(
@@ -428,7 +440,6 @@ async def _post_new_problem_locked(
                 post_msg=post_msg,
                 sample_messages=sample_messages,
                 notes_message=notes_message,
-                snake_enabled=True,
             )
         except Exception as exc:
             logger.warning(

@@ -181,43 +181,47 @@ def test_resolve_bot_display_name_falls_back_and_fails_soft(monkeypatch):
     print("✅ resolve_bot_display_name: fallback + fail-soft to empty")
 
 
-def test_build_problem_card_nodes_components(monkeypatch, tmp_path):
-    snake = tmp_path / "snake_trio.jpg"
-    snake.write_bytes(b"fakesnake")
-    monkeypatch.setattr(shared, "snake_image_path", lambda: str(snake))
-
+def test_build_problem_card_nodes_components():
+    diagrams = [
+        [client.build_text("示意图 1"), {"type": "image", "data": {"file": "base64://Zmlyc3Q="}}],
+        [client.build_text("示意图 2"), {"type": "image", "data": {"file": "base64://c2Vjb25k"}}],
+    ]
     nodes = shared.build_problem_card_nodes(
         post_msg="正文",
         sample_messages=["样例1", "样例2"],
         notes_message="解释",
-        snake_enabled=True,
+        diagram_messages=diagrams,
         bot_qq=1,
         bot_name="Bot",
     )
-    # post + 2 samples + notes + snake image
-    assert len(nodes) == 5, nodes
+    # post + 2 samples + notes + 2 original diagrams
+    assert len(nodes) == 6, nodes
     assert all(
         n["type"] == "node" and n["data"]["user_id"] == 1 and n["data"]["nickname"] == "Bot"
         for n in nodes
     )
     assert nodes[0]["data"]["content"][0]["data"]["text"] == "正文"
     assert nodes[3]["data"]["content"][0]["data"]["text"] == "解释"
-    assert nodes[4]["data"]["content"][0]["type"] == "image"
-    assert nodes[4]["data"]["content"][0]["data"]["file"].startswith("base64://")
-    print("✅ build_problem_card_nodes: one node per component incl. snake")
+    assert [node["data"]["content"] for node in nodes[4:]] == diagrams
+    legacy = shared.build_problem_card_legacy_segments(
+        post_msg="正文", sample_messages=["样例1", "样例2"],
+        notes_message="解释", diagram_messages=diagrams,
+    )
+    assert legacy == [node["data"]["content"] for node in nodes]
+    print("✅ problem card: custom and legacy cards share original diagrams in source order")
 
 
-def test_build_problem_card_nodes_omits_optional_parts(monkeypatch, tmp_path):
-    monkeypatch.setattr(shared, "snake_image_path", lambda: str(tmp_path / "missing.jpg"))
-
+def test_build_problem_card_nodes_omits_optional_parts():
     nodes = shared.build_problem_card_nodes(
         post_msg="正文",
         sample_messages=[],
         notes_message="",
-        snake_enabled=True,
         bot_qq=1,
         bot_name="",
     )
     assert len(nodes) == 1
     assert nodes[0]["data"]["nickname"] == "1"  # empty lookup falls back to the QQ
-    print("✅ build_problem_card_nodes: missing snake/notes degrade cleanly")
+    assert shared.build_problem_card_legacy_segments(post_msg="正文", sample_messages=[]) == [
+        [client.build_text("正文")],
+    ]
+    print("✅ problem card: no diagram metadata means no image")

@@ -4,6 +4,7 @@ from .. import registry
 from ..registry import CommandDef
 from ..shared import (
     build_scoreboard_entries,
+    build_problem_diagram_messages,
     fetch_group_member_nickname_map,
     format_points,
     get_today_problem,
@@ -120,14 +121,13 @@ async def resend_current_problem_group(group_id: int, sender: dict) -> None:
             post_msg = daily_msg.get("post_msg")
             sample_messages = daily_msg.get("sample_messages")
             notes_message = daily_msg.get("notes_message")
-            snake_enabled = bool(daily_msg.get("snake_enabled", True))
             if isinstance(post_msg, str) and isinstance(sample_messages, list):
                 fwd_resp, _node_payload = await _send_problem_forward_card(
                     group_id=group_id,
                     post_msg=post_msg,
                     sample_messages=[str(item) for item in sample_messages],
                     notes_message=str(notes_message) if isinstance(notes_message, str) else "",
-                    snake_enabled=snake_enabled,
+                    diagram_messages=await build_problem_diagram_messages(pid),
                 )
                 if fwd_resp:
                     if pid:

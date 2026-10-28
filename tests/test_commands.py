@@ -2700,7 +2700,7 @@ def test_problem_resend_rebuilds_card_from_cached_content():
     card_text = _card_texts()
     assert "题目正文" in card_text, card_text
     assert "样例 1" in card_text, card_text
-    assert any(
+    assert not any(
         seg.get("type") == "image"
         for node in nodes for seg in node["data"]["content"]
     ), nodes
@@ -2708,11 +2708,52 @@ def test_problem_resend_rebuilds_card_from_cached_content():
         saved = json.load(f)
     assert "fwd_message_id" not in saved
     assert "msg_id" not in saved and "sample_msg_ids" not in saved, saved
+    assert "snake_enabled" not in saved and "snake_msg_id" not in saved, saved
     with open(os.path.join(_data_dir(), "groups", str(GID), "problem_card_refs.json")) as f:
         refs = json.load(f)
     assert refs["2001"]["problem"] == PID
     _cleanup()
     print("✅ problem: rebuilds card from cached content (legacy ids ignored)")
+
+
+def test_problem_resend_diagrams_follow_current_pid_instead_of_cached_images():
+    _reset_state()
+    try:
+        _setup_problem_for(GID, PID)
+        _write_statement(PID, {"description": "first", "images": [
+            {"src": "https://example.com/first.png", "kind": "graphic"},
+            {"src": "https://example.com/formula.png", "kind": "formula"},
+        ]})
+        _write_statement(PID2, {"description": "second", "images": [
+            {"src": "https://example.com/second.png", "kind": "graphic"},
+        ]})
+        download = AsyncMock(side_effect=[
+            "data:image/png;base64,Zmlyc3Q=", "data:image/png;base64,c2Vjb25k",
+        ])
+
+        with _all_patches(), patch("kouhai_bot.handlers.shared._download_image_data_url_async", download):
+            from kouhai_bot.handlers.cmd.stubs import handle_problem
+
+            for pid in (PID, PID2):
+                _write_state(GID, {"today": pid})
+                _write_group_file(GID, "daily_msg.json", {
+                    "pid": pid, "post_msg": "题目正文", "sample_messages": ["样例"],
+                    "snake_enabled": True, "snake_msg_id": 123,
+                    "diagram_messages": [[{"type": "image", "data": {"file": "base64://c3RhbGU="}}]],
+                })
+                asyncio.run(handle_problem(**_kwargs(_make_event("/problem"))))
+
+        assert len(_forwarded) == 2
+        assert [
+            [segment["data"]["file"] for node in card["messages"]
+             for segment in node["data"]["content"] if segment.get("type") == "image"]
+            for card in _forwarded
+        ] == [["base64://Zmlyc3Q="], ["base64://c2Vjb25k"]]
+        assert [call.args[0] for call in download.await_args_list] == [
+            "https://example.com/first.png", "https://example.com/second.png",
+        ]
+    finally:
+        _cleanup()
 
 
 def test_problem_rebuilds_forward_card_when_cached_text_has_thinking_tags():
@@ -3562,6 +3603,104 @@ def test_newproblem_fallback_direct_saves_daily_msg_for_current_pid():
     prefetcher.release.assert_awaited_once_with("slot-1")
     _cleanup()
     print("✅ newproblem: fallback direct saves daily_msg for current pid")
+
+
+def test_newproblem_sends_original_diagrams_in_forward_and_direct_fallback():
+    for fallback in (False, True):
+        _reset_state()
+        try:
+            _setup_problem()
+            _write_statement(PID2, {"description": "next", "images": [
+                {"src": "https://example.com/next.png", "kind": "graphic"},
+                {"src": "https://example.com/formula.png", "kind": "formula"},
+            ]})
+            prefetcher = _fake_problem_prefetcher(
+                {"today": PID2}, sample_messages=("SAMPLE",), notes_message="NOTE",
+            )
+            download = AsyncMock(return_value="data:image/png;base64,bmV4dA==")
+            with _all_patches(), ExitStack() as extra:
+                extra.enter_context(patch(
+                    "kouhai_bot.handlers.cmd.newproblem.get_next_problem_prefetcher",
+                    return_value=prefetcher,
+                ))
+                extra.enter_context(patch("kouhai_bot.handlers.shared._download_image_data_url_async", download))
+                if fallback:
+                    extra.enter_context(patch(
+                        "kouhai_bot.handlers.cmd.newproblem.send_forward_card_with_legacy_fallback",
+                        AsyncMock(return_value=None),
+                    ))
+                from kouhai_bot.handlers.cmd.newproblem import _post_new_problem_locked
+
+                assert asyncio.run(_post_new_problem_locked(GID, prefix="NEW CARD"))
+
+            if fallback:
+                messages = [item["message"] for item in _sent]
+                assert not _forwarded
+            else:
+                assert len(_forwarded) == 1
+                messages = [node["data"]["content"] for node in _forwarded[0]["messages"]]
+            assert [
+                segment["data"]["file"] for message in messages for segment in message
+                if segment.get("type") == "image"
+            ] == ["base64://bmV4dA=="]
+            text = "\n".join(
+                segment["data"]["text"] for message in messages for segment in message
+                if segment.get("type") == "text"
+            )
+            assert "NEW CARD" in text and "SAMPLE" in text and "NOTE" in text
+            download.assert_awaited_once_with("https://example.com/next.png")
+            prefetcher.release.assert_awaited_once_with("slot-1")
+            with open(os.path.join(_data_dir(), "groups", str(GID), "daily_msg.json"), encoding="utf-8") as f:
+                daily = json.load(f)
+            assert daily["pid"] == PID2
+            assert "snake_enabled" not in daily
+        finally:
+            _cleanup()
+
+
+def test_newproblem_direct_diagram_failure_keeps_other_content_and_retry_notice():
+    _reset_state()
+    try:
+        _setup_problem()
+        _write_statement(PID2, {"description": "next", "images": [
+            {"src": "https://example.com/first.png", "kind": "graphic"},
+            {"src": "https://example.com/second.png", "kind": "graphic"},
+        ]})
+        prefetcher = _fake_problem_prefetcher(
+            {"today": PID2}, sample_messages=("SAMPLE",), notes_message="NOTE",
+        )
+
+        async def send_with_failed_diagram(group_id, message):
+            await _mock_send_group(group_id, message)
+            return not any(
+                segment.get("type") == "image" and segment["data"]["file"] == "base64://Zmlyc3Q="
+                for segment in message
+            )
+
+        with _all_patches(), \
+            patch("kouhai_bot.handlers.cmd.newproblem.get_next_problem_prefetcher", return_value=prefetcher), \
+            patch("kouhai_bot.handlers.shared._download_image_data_url_async", AsyncMock(side_effect=[
+                "data:image/png;base64,Zmlyc3Q=", "data:image/png;base64,c2Vjb25k",
+            ])), \
+            patch("kouhai_bot.handlers.cmd.newproblem.send_forward_card_with_legacy_fallback", AsyncMock(return_value=None)), \
+            patch("kouhai_bot.handlers.cmd.newproblem.send_group_msg", send_with_failed_diagram):
+            from kouhai_bot.handlers.cmd.newproblem import _post_new_problem_locked
+
+            assert asyncio.run(_post_new_problem_locked(GID, prefix="NEW CARD"))
+
+        assert _has_sent("SAMPLE") and _has_sent("NOTE")
+        assert _has_sent("部分题面内容发送失败，可稍后用 /pb 重试。")
+        assert [
+            segment["data"]["file"] for item in _sent for segment in item["message"]
+            if segment.get("type") == "image"
+        ] == ["base64://Zmlyc3Q=", "base64://c2Vjb25k"]
+        with open(os.path.join(_data_dir(), "groups", str(GID), "state.json"), encoding="utf-8") as f:
+            assert json.load(f)["today"] == PID2
+        with open(os.path.join(_data_dir(), "groups", str(GID), "daily_msg.json"), encoding="utf-8") as f:
+            assert json.load(f)["pid"] == PID2
+        prefetcher.release.assert_awaited_once_with("slot-1")
+    finally:
+        _cleanup()
 
 
 def test_submit_scoreboard_update_settles_late_old_problem():
@@ -5112,6 +5251,125 @@ def test_private_problem_card_rebuilds_when_cache_has_only_legacy_ids():
     assert "当前题目" not in node_text, node_text
     _cleanup()
     print("✅ private problem card: rebuilds when cache has only legacy ids")
+
+
+def test_private_problem_diagrams_use_statement_on_cached_card_and_direct_fallback():
+    for fallback in (False, True):
+        _reset_state()
+        try:
+            _setup_problem()
+            _write_statement(PID, {"description": "current", "images": [
+                {"src": "https://example.com/current.png", "kind": "graphic"},
+            ]})
+            _write_group_file(GID, "daily_msg.json", {
+                "pid": PID, "post_msg": "CACHED CARD", "sample_messages": ["CACHED SAMPLE"],
+                "notes_message": "CACHED NOTE", "snake_enabled": True, "snake_msg_id": 123,
+                "diagram_messages": [[{"type": "image", "data": {"file": "base64://c3RhbGU="}}]],
+            })
+            download = AsyncMock(return_value="data:image/png;base64,Y3VycmVudA==")
+            with _all_patches(), ExitStack() as extra:
+                extra.enter_context(patch("kouhai_bot.handlers.shared._download_image_data_url_async", download))
+                rebuild = extra.enter_context(patch(
+                    "kouhai_bot.private_judge.build_problem_card_payload",
+                    AsyncMock(side_effect=AssertionError("usable cached content must be reused")),
+                ))
+                if fallback:
+                    extra.enter_context(patch(
+                        "kouhai_bot.private_judge.send_forward_card_with_legacy_fallback",
+                        AsyncMock(return_value=None),
+                    ))
+                from kouhai_bot.private_judge import send_problem_card_private
+
+                assert asyncio.run(send_problem_card_private(UID, GID, {"today": PID}))
+                rebuild.assert_not_awaited()
+
+            if fallback:
+                messages = [item["message"] for item in _private_sent]
+                assert not _private_forwarded
+            else:
+                assert len(_private_forwarded) == 1
+                messages = [node["data"]["content"] for node in _private_forwarded[0]["messages"]]
+            assert [
+                segment["data"]["file"] for message in messages for segment in message
+                if segment.get("type") == "image"
+            ] == ["base64://Y3VycmVudA=="]
+            text = "\n".join(
+                segment["data"]["text"] for message in messages for segment in message
+                if segment.get("type") == "text"
+            )
+            assert "CACHED CARD" in text and "CACHED SAMPLE" in text and "CACHED NOTE" in text
+            assert "https://" not in text and PID not in text
+            download.assert_awaited_once_with("https://example.com/current.png")
+        finally:
+            _cleanup()
+
+
+def test_private_problem_direct_diagram_failure_keeps_other_content_and_retry_notice():
+    _reset_state()
+    try:
+        _setup_problem()
+        _write_statement(PID, {"description": "current", "images": [
+            {"src": "https://example.com/first.png", "kind": "graphic"},
+            {"src": "https://example.com/second.png", "kind": "graphic"},
+        ]})
+        _write_group_file(GID, "daily_msg.json", {
+            "pid": PID, "post_msg": "MAIN CARD", "sample_messages": ["SAMPLE"],
+            "notes_message": "NOTE",
+        })
+
+        async def send_with_failed_diagram(user_id, message):
+            message_id = await _mock_send_private(user_id, message)
+            if any(
+                segment.get("type") == "image" and segment["data"]["file"] == "base64://Zmlyc3Q="
+                for segment in message
+            ):
+                return None
+            return message_id
+
+        with _all_patches(), \
+            patch("kouhai_bot.handlers.shared._download_image_data_url_async", AsyncMock(side_effect=[
+                "data:image/png;base64,Zmlyc3Q=", "data:image/png;base64,c2Vjb25k",
+            ])), \
+            patch("kouhai_bot.private_judge.send_forward_card_with_legacy_fallback", AsyncMock(return_value=None)), \
+            patch("kouhai_bot.private_judge.send_private_msg", send_with_failed_diagram):
+            from kouhai_bot.private_judge import send_problem_card_private
+
+            assert asyncio.run(send_problem_card_private(UID, GID, {"today": PID}))
+
+        text = "\n".join(_last_text_item(item) for item in _private_sent)
+        assert "MAIN CARD" in text and "SAMPLE" in text and "NOTE" in text
+        assert "部分题面内容发送失败，可稍后用 /pb 重试。" in text
+        assert [
+            segment["data"]["file"] for item in _private_sent for segment in item["message"]
+            if segment.get("type") == "image"
+        ] == ["base64://Zmlyc3Q=", "base64://c2Vjb25k"]
+        with open(os.path.join(_data_dir(), "groups", str(GID), "problem_card_refs.json"), encoding="utf-8") as f:
+            refs = json.load(f)
+        assert len(refs) == 4, refs
+    finally:
+        _cleanup()
+
+
+def test_private_problem_direct_main_text_failure_returns_false_without_components():
+    _reset_state()
+    try:
+        _setup_problem()
+        _write_group_file(GID, "daily_msg.json", {
+            "pid": PID, "post_msg": "MAIN CARD", "sample_messages": ["SAMPLE"],
+            "notes_message": "NOTE",
+        })
+        send = AsyncMock(return_value=None)
+        with _all_patches(), \
+            patch("kouhai_bot.private_judge.send_forward_card_with_legacy_fallback", AsyncMock(return_value=None)), \
+            patch("kouhai_bot.private_judge.send_private_msg", send):
+            from kouhai_bot.private_judge import send_problem_card_private
+
+            assert not asyncio.run(send_problem_card_private(UID, GID, {"today": PID}))
+
+        send.assert_awaited_once_with(UID, [{"type": "text", "data": {"text": "MAIN CARD"}}])
+        assert not os.path.exists(os.path.join(_data_dir(), "groups", str(GID), "problem_card_refs.json"))
+    finally:
+        _cleanup()
 
 
 def test_private_problem_card_falls_back_when_forward_fails():
