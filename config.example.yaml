@@ -67,7 +67,13 @@ llm:
 #   timeout_sec: 60
 
 # ── 群聊配置 ──
-current_group: 987654321  # 服务的 QQ 群号
+# 单群配置：将占位符替换为群号。current_group 与 current_groups 只能选一个。
+current_group: "<service_group_id>"
+# 多群配置：删除上面的 current_group，启用以下列表，第一项为主群。
+# 一个 Bot / NapCat 连接同时服务所有群，每群的题目、积分和预取独立。
+# current_groups:
+#   - "<primary_group_id>"
+#   - "<another_group_id>"
 
 # ── 题目选择 ──
 problem:

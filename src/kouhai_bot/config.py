@@ -133,6 +133,7 @@ class BotConfig:
 
     # --- Group ---
     current_group: int = 0
+    current_groups: list[int] = field(default_factory=list)
 
     # --- Problems ---
     min_rating: int = 2000
@@ -152,6 +153,10 @@ class BotConfig:
     sessions_dir: str = ""
 
     def __post_init__(self) -> None:
+        groups = self.current_groups or ([self.current_group] if self.current_group else [])
+        self.current_groups = list(dict.fromkeys(int(group_id) for group_id in groups))
+        if self.current_groups:
+            self.current_group = self.current_groups[0]
         if not self.sessions_dir:
             self.sessions_dir = os.path.join(self.data_dir, "sessions")
 
@@ -234,10 +239,48 @@ class BotConfig:
         c.qwen_base_url = str(qwen.get("base_url", c.qwen_base_url))
         c.qwen_model = str(qwen.get("model", ""))
 
-        # --- Group ---
-        if "current_group" not in data:
-            raise RuntimeError("config.yaml: current_group is required")
-        c.current_group = int(data["current_group"])
+        # --- Groups ---
+        has_single_group = "current_group" in data
+        has_group_list = "current_groups" in data
+        if has_single_group and has_group_list:
+            raise RuntimeError(
+                "config.yaml: use either current_group or current_groups, not both"
+            )
+        if not has_single_group and not has_group_list:
+            raise RuntimeError(
+                "config.yaml: current_group or current_groups is required"
+            )
+
+        raw_groups = data["current_groups"] if has_group_list else [data["current_group"]]
+        if not isinstance(raw_groups, list):
+            raise RuntimeError("config.yaml: current_groups must be a list")
+        if not raw_groups:
+            raise RuntimeError("config.yaml: current_groups must not be empty")
+
+        group_ids: list[int] = []
+        for raw_group_id in raw_groups:
+            if isinstance(raw_group_id, bool) or not isinstance(
+                raw_group_id,
+                (int, str),
+            ):
+                raise RuntimeError(
+                    f"config.yaml: invalid QQ group id: {raw_group_id!r}"
+                )
+            try:
+                group_id = int(raw_group_id)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"config.yaml: invalid QQ group id: {raw_group_id!r}"
+                ) from exc
+            if group_id <= 0:
+                raise RuntimeError(
+                    f"config.yaml: invalid QQ group id: {raw_group_id!r}"
+                )
+            if group_id not in group_ids:
+                group_ids.append(group_id)
+
+        c.current_groups = group_ids
+        c.current_group = group_ids[0]
 
         # --- Problems ---
         problem = data.get("problem", {})
@@ -288,3 +331,13 @@ def get_config() -> BotConfig:
     if _config is None:
         _config = BotConfig.from_yaml()
     return _config
+
+
+def configured_group_ids(cfg: object | None = None) -> tuple[int, ...]:
+    """Return configured service groups, including legacy single-group configs."""
+    cfg = cfg or get_config()
+    raw_groups = getattr(cfg, "current_groups", None)
+    if raw_groups:
+        return tuple(dict.fromkeys(int(group_id) for group_id in raw_groups))
+    current_group = int(getattr(cfg, "current_group", 0) or 0)
+    return (current_group,) if current_group > 0 else ()

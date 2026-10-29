@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .config import get_config
+from .config import configured_group_ids, get_config
 from .napcat.client import (
     get_doubt_friends_add_requests,
     set_doubt_friends_add_request,
@@ -42,8 +42,15 @@ async def is_service_group_member(group_id: int, user_id: int) -> bool:
         return False
 
 
+async def _member_service_group(user_id: int) -> int | None:
+    for group_id in configured_group_ids(get_config()):
+        if await is_service_group_member(group_id, user_id):
+            return group_id
+    return None
+
+
 async def handle_friend_request_event(event: dict) -> None:
-    """Approve a normal OneBot friend request when the requester is in CURRENT_GROUP."""
+    """Approve a friend request from a confirmed service-group member."""
     if event.get("request_type") != "friend":
         return
 
@@ -57,11 +64,11 @@ async def handle_friend_request_event(event: dict) -> None:
     if str(user_id) == str(cfg.bot_qq):
         return
 
-    if not await is_service_group_member(cfg.current_group, user_id):
+    member_group_id = await _member_service_group(user_id)
+    if member_group_id is None:
         logger.info(
-            "friend request from user_%s ignored: not a confirmed member of group_%s",
+            "friend request from user_%s ignored: not a confirmed service-group member",
             user_id,
-            cfg.current_group,
         )
         return
 
@@ -83,11 +90,11 @@ async def approve_doubt_friend_requests(*, count: int = 50) -> int:
             continue
         if str(user_id) == str(cfg.bot_qq):
             continue
-        if not await is_service_group_member(cfg.current_group, user_id):
+        member_group_id = await _member_service_group(user_id)
+        if member_group_id is None:
             logger.info(
-                "doubtful friend request from user_%s ignored: not a confirmed member of group_%s",
+                "doubtful friend request from user_%s ignored: not a confirmed service-group member",
                 user_id,
-                cfg.current_group,
             )
             continue
         if await set_doubt_friends_add_request(flag, approve=True):

@@ -42,7 +42,7 @@ NapCat (QQ) ──WS──> worker.py
                          ├── process_event(..., spawn_handlers=True)
                          ├── cmd/*.py  auto-discovered by registry
                          ├── scheduler/ background loop (60s tick)
-                         └── next-problem prefetch loop (one READY slot)
+                         └── per-group next-problem prefetch loops (one READY slot each)
 ```
 
 ## Key Design Decisions
@@ -55,7 +55,7 @@ NapCat (QQ) ──WS──> worker.py
   `usage` field = args suffix in /help display (e.g. `usage="你的做法"` → `/submit 你的做法`). Group help hides private-only details for `/setproblem`, `/sync`, and `/testcd` and only briefly mentions private judge; private help lists the private-judge command set.
   Group and private help are both delivered as merged-forward cards, with direct text
   only as fallback.
-- **Scheduler current-group config**: `~/.kouhai-bot/scheduler_config.json` stores job list + time overrides for `CURRENT_GROUP`. Jobs are defined in `scheduler/jobs.py`.
+- **Scheduler service-group config**: `~/.kouhai-bot/scheduler_config.json` stores job lists + time overrides for every configured service group. Jobs are defined in `scheduler/jobs.py`.
 - **Multimodal statements**: `problems/fetcher.py` collects CF `tex-formula` and `tex-graphics` image metadata with statement text. Formula images and diagrams are attached to new-problem summary and `/clarify` requests, which route through `llm.general_model` like every other non-judge task; those providers must therefore accept image inputs. (A legacy `llm.multimodal_model` config section is deduplicated by name and appended to the general queue with a warning.)
 - **Problem-card diagrams**: Group and private problem cards attach the current problem's original `graphic` images in source order, loaded by pid from its statement cache. Formula images stay in LLM context only. Diagram bytes are sent as OneBot base64 images for Docker compatibility; a failed download produces a `/pb` retry notice without dropping other content. Cards never append the fixed mascot. Legacy `snake_enabled` and node-id fields are discarded when rebuilding cached cards.
 - **Unified CF HTML transport**: `problems/cf_fetcher.py` is the single transport for
@@ -115,9 +115,9 @@ NapCat (QQ) ──WS──> worker.py
   `match=false`. This prevents attaching the wrong editorial when problem
   names are similar but not identical.
 - **No hermes cron involvement**: The bot runs its own scheduler loop (`scheduler/engine.py`), not hermes cron jobs.
-- **Single worker runtime**: `worker.py` keeps the NapCat reverse-WS connection,
-  dispatches commands, and owns the scheduler, next-problem prefetch loop, and
-  current/next editorial maintenance loop in one process. There is no SQLite event
+- **Single worker runtime**: `worker.py` keeps one shared NapCat reverse-WS connection,
+  dispatches commands, and owns the scheduler plus one next-problem prefetch and
+  current/next editorial maintenance loop per configured group in one process. There is no SQLite event
   queue, ingress supervisor, worker hot-swap, or auto-update loop.
 - **Next-problem prefetch**: `problem_preparation.py` contains the complete blocking
   group-problem preparation pipeline (pick/fetch, samples, translated notes, audited
@@ -144,7 +144,7 @@ NapCat (QQ) ──WS──> worker.py
   This editorial maintenance never blocks a `/newproblem` claim. `/setproblem` and
   `/setproblem random` intentionally keep their live-fetch behavior and never use this
   slot.
-- **Friend request auto-approval**: Normal OneBot `post_type="request"` / `request_type="friend"` events are parsed by `napcat/client.py`, routed by `handlers.process_event()`, and approved via `set_friend_add_request`. QQ/NapCat "doubtful" friend requests are not reliably pushed as request events, so `worker.py` also runs `friend_requests.doubt_friend_request_loop()`, which polls `get_doubt_friends_add_request` every 60 seconds and approves with `set_doubt_friends_add_request`. Both paths approve only after the requester is confirmed to be a member of `CURRENT_GROUP`; lookup failure, malformed events, non-friend requests, and non-members are ignored without approving. Requests that were already consumed by another QQ client may not appear in the doubtful-request poll.
+- **Friend request auto-approval**: Normal OneBot `post_type="request"` / `request_type="friend"` events are parsed by `napcat/client.py`, routed by `handlers.process_event()`, and approved via `set_friend_add_request`. QQ/NapCat "doubtful" friend requests are not reliably pushed as request events, so `worker.py` also runs `friend_requests.doubt_friend_request_loop()`, which polls `get_doubt_friends_add_request` every 60 seconds and approves with `set_doubt_friends_add_request`. Both paths approve only after the requester is confirmed to be a member of at least one configured service group; lookup failure, malformed events, non-friend requests, and non-members are ignored without approving. Requests that were already consumed by another QQ client may not appear in the doubtful-request poll.
 - **User groups**: `user_groups.py` — all users default to `default`; `USER_GROUPS` configures
   non-default groups such as `starred`/`打星`, their members, submit delay, and rejection
   message. `submit_delay_sec > 0` enables dynamic per-user submit waits for that group:
@@ -226,7 +226,8 @@ All providers use the OpenAI-compatible `/chat/completions` endpoint.
 | `napcat_ws_port` | int | 8095 | WS listen port |
 | `napcat_http_host` | str | `127.0.0.1` | NapCat HTTP API host |
 | `napcat_http_port` | int | 3000 | NapCat HTTP API port |
-| `current_group` | int | — | QQ group served by the bot (**required**) |
+| `current_group` | int | — | Legacy single service group; mutually exclusive with `current_groups` |
+| `current_groups` | list[int] | — | Ordered service groups; first is primary; mutually exclusive with `current_group` |
 | `data_dir` | str | `~/.kouhai-bot` | Shared data directory |
 
 #### `llm` section
@@ -518,7 +519,7 @@ tutorial_translations/<pid>.txt  # cached Chinese editorial for group cards (per
 tutorial_translations/<pid>.verified # statement+editorial-bound READY marker
 tutorial_translations/<pid>.no_editorial # exhaustive source-bound no-match marker
 sessions/                    # per-user session context
-scheduler_config.json        # job config for CURRENT_GROUP
+scheduler_config.json        # per-group job config for all configured service groups
 ```
 
 Current-worktree runtime state is stored under the repository checkout, not under the
@@ -638,17 +639,22 @@ handlers. Tests may pass `spawn_handlers=False` to await a handler directly.
 
 Read-only commands (`/problem`, `/tag`, `/scoreboard`, `/help`, `/status`) still do
 not enter the state scheduler.
-Private dispatch maps DMs to `CURRENT_GROUP`, requires the sender to be a member of that
-service group, and only allows the private command whitelist: `/setproblem`, `/problem`,
+Private dispatch checks configured groups in order and selects the first group whose
+membership lookup confirms the sender. It rejects users not confirmed in any service
+group and only allows the private command whitelist: `/setproblem`, `/problem`,
 `/tag`, `/submit`, `/clarify`, `/review`, `/feedback`, `/clear`, `/sync`, `/testcd`, `/status`,
 and `/help`.
 Private commands do not require @mentions and should not send @ segments back.
+Private history and clear watermarks are scoped by user and problem, independent of
+the selected service group. A group submit redirected to private judge must carry
+its original problem snapshot through admission; another group's redirect may change
+the user's current private problem while QQ messages are being sent.
 
 Friend request events are not commands and are not logged to command event logs.
 `process_event()` handles normal `type="request"` friend requests before message
 dispatch. `worker.py` separately polls NapCat's doubtful friend request list because
 those requests may only appear through `get_doubt_friends_add_request`. The poller
-runs every 60 seconds. Both paths accept only confirmed `CURRENT_GROUP` members and
+runs every 60 seconds. Both paths accept only confirmed members of any configured service group and
 otherwise return silently; requests already consumed by another QQ client may not be
 visible to the poller.
 
@@ -763,7 +769,7 @@ private judge.
 ### Private Judge
 
 Private judge lives in `private_judge.py` plus `/setproblem` and `/sync` command
-modules. It is available only in DMs from members of `CURRENT_GROUP`; group-only
+modules. It is available only in DMs from members of a configured service group; group-only
 commands are rejected in private with a friendly message.
 
 - Private state is per user in `private_judge/users/<uid>.json`: current problem,
@@ -822,6 +828,8 @@ pid when admitting the request and carry that pid through compute + finalize, or
 newer AC can silently retarget an older review request.
 
 ### `/newproblem`
+
+Each service group has its own post lock, cooldown and READY slot.
 
 `/newproblem` vs `/newproblem --force` when today's problem is unsolved:
 
@@ -954,8 +962,8 @@ Local HTML labeling UI:
 
 ## Scheduler
 
-- **Engine**: `scheduler/engine.py` — loop at 60s intervals, runs due jobs per group
-  configured by `CURRENT_GROUP`; accepts `stop_event` so the single worker can stop cleanly
+- **Engine**: `scheduler/engine.py` — loop at 60s intervals, runs due jobs for every
+  configured service group; accepts `stop_event` so the single worker can stop cleanly
 - **Jobs** (defined in `scheduler/jobs.py`):
   - `contest_check` — 12:01: checks CF API for 24h upcoming contests, @all notification with 2s delay.
 - `/newproblem` has a
@@ -979,7 +987,7 @@ Local HTML labeling UI:
 
 1. Add an async function in `scheduler/jobs.py`
 2. Call `register_job(JobDef(name=..., fn=..., schedule="HH:MM"))`
-3. Enable it for `CURRENT_GROUP` in `scheduler_config.json`
+3. Enable it for the desired service groups in `scheduler_config.json`
 
 ## Data Format (critical for compatibility)
 
@@ -1055,7 +1063,7 @@ same reply appends a new entry). Shape:
     {
       "id": 1,                          // max(existing ids)+1 per file; reports never move between files
       "scope": "group",                 // "group" | "private" — the scope where /feedback was issued
-      "group_id": 999999,               // private scope stores cfg.current_group (dispatcher rewrite)
+      "group_id": 999999,               // private scope stores the group selected by membership lookup
       "user_id": 42,
       "reported_at": "2026-09-11T21:03:14.512345+08:00",
       "note": "复杂度分析说错了",          // optional user note, stripped, capped at 500 chars
@@ -1143,7 +1151,8 @@ silently fails.
 ### 8. Friend requests require confirmed service-group membership
 Auto-approval must remain fail-closed. Do not call `set_friend_add_request` or
 `set_doubt_friends_add_request` unless NapCat confirms the requester is in
-`CURRENT_GROUP`; if member lookup fails, ignore the request rather than approving it.
+at least one configured service group; if every member lookup fails, ignore the request
+rather than approving it.
 
 ### 9. save_scoreboard needs indent=2
 Must pass `json.dump(sb, f, ensure_ascii=False, indent=2)` for backward compatibility
@@ -1309,7 +1318,7 @@ uv run start
 `uv run start` launches a detached background instance. stdout/stderr are appended to:
 
 ```text
-~/.kouhai-bot/logs/<CURRENT_GROUP>/YYYY-MM-DD.log
+~/.kouhai-bot/logs/<primary_group_id>/YYYY-MM-DD.log
 ```
 
 If the configured `NAPCAT_WS_PORT` is already in use, `uv run start` should print a
@@ -1327,8 +1336,8 @@ uv run python -m kouhai_bot.worker
 ```
 
 The worker starts the WS server, discovers commands, registers scheduler jobs,
-maintains one READY next problem plus current/next editorial preparation, and runs the
-scheduler. No external cron or process manager needed.
+maintains one READY next problem plus current/next editorial preparation per configured
+group, and runs the scheduler. No external cron or process manager needed.
 
 For an already-managed local instance, prefer:
 
@@ -1365,10 +1374,18 @@ Interpretation:
 
 ## Deployment & Groups
 
-The served group is configured via `config.yaml`:
-- `current_group` — the single QQ group where commands work and scheduled posts are sent
+Service groups are configured through exactly one key in `config.yaml`:
 
-Start with a test group first; switch `current_group` to the production group after verification.
+- `current_group` — backward-compatible single-group form.
+- `current_groups` — nonempty ordered list of positive group IDs; the first is primary.
+
+`configured_group_ids()` is the shared compatibility helper. Duplicate IDs are removed
+without changing order. All groups share one bot account and NapCat connection, while
+current problems, scoreboards, histories, post locks, cooldowns and prefetch slots stay
+isolated under `groups/<gid>/`. Statement and editorial caches remain shared by pid.
+Private commands use the first configured group whose membership lookup confirms the
+sender; private state remains per user. The selected group supplies default `/sp`,
+private `/sync` and `/testcd` context. Start with a test group before enabling more groups.
 
 Production and test bot instances must use separate NapCat reverse WebSocket ports.
 When starting or restarting a bot, use the production port for the production bot and

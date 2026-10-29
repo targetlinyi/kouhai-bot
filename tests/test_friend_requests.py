@@ -195,3 +195,81 @@ def test_private_dispatch_uses_shared_service_group_member_check(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["group_id"] == 999999
     assert calls[0]["user_id"] == 456
+
+
+def test_friend_request_member_of_second_service_group_is_approved(monkeypatch):
+    approved_flags = []
+    cfg = SimpleNamespace(
+        bot_qq=1,
+        current_group=111111,
+        current_groups=[111111, 222222],
+    )
+
+    async def fake_http_post(action, data):
+        if data["group_id"] == 222222 and action == "get_group_member_info":
+            return {"status": "ok", "data": {"user_id": 456}}
+        if action == "get_group_member_info":
+            return {"status": "failed", "data": None}
+        if action == "get_group_member_list":
+            return {"status": "ok", "data": []}
+        raise AssertionError(action)
+
+    async def fake_set_friend_add_request(flag, *, approve=True, remark=""):
+        approved_flags.append(flag)
+        return True
+
+    monkeypatch.setattr("kouhai_bot.friend_requests.get_config", lambda: cfg)
+    monkeypatch.setattr("kouhai_bot.napcat.client._http_post", fake_http_post)
+    monkeypatch.setattr(
+        "kouhai_bot.friend_requests.set_friend_add_request",
+        fake_set_friend_add_request,
+    )
+
+    asyncio.run(process_event(_friend_request(), spawn_handlers=False))
+
+    assert approved_flags == ["flag-123"]
+
+
+def test_private_dispatch_selects_first_group_where_user_is_member(monkeypatch):
+    calls = []
+    cfg = SimpleNamespace(
+        bot_qq=1,
+        current_group=111111,
+        current_groups=[111111, 222222],
+    )
+
+    async def fake_handler(**kwargs):
+        calls.append(kwargs)
+
+    async def fake_is_service_group_member(group_id, user_id):
+        assert user_id == 456
+        return group_id == 222222
+
+    monkeypatch.setattr("kouhai_bot.handlers.get_config", lambda: cfg)
+    monkeypatch.setattr(
+        "kouhai_bot.handlers.is_service_group_member",
+        fake_is_service_group_member,
+    )
+    monkeypatch.setattr(
+        "kouhai_bot.handlers.registry.get",
+        lambda name: SimpleNamespace(name="status", handler=fake_handler)
+        if name == "status"
+        else None,
+    )
+
+    event = {
+        "type": "message",
+        "message_type": "private",
+        "group_id": 0,
+        "user_id": 456,
+        "sender": {"nickname": "Tester", "card": "", "user_id": 456},
+        "message_id": "priv-multi",
+        "raw_message": "/status",
+        "message": [{"type": "text", "data": {"text": "/status"}}],
+        "raw": {},
+    }
+
+    asyncio.run(process_event(event, spawn_handlers=False))
+
+    assert len(calls) == 1
+    assert calls[0]["group_id"] == 222222

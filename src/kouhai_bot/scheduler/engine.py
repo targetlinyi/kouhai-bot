@@ -1,6 +1,6 @@
-"""Job scheduler — cron-like task execution for group checks.
+"""Cron-like task execution for every configured service group.
 
-Jobs are defined in jobs.py and configured for CURRENT_GROUP via scheduler_config.json.
+Jobs are defined in jobs.py and configured per group via scheduler_config.json.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from ..config import get_config
+from ..config import configured_group_ids, get_config
 
 logger = logging.getLogger("kouhai-bot.scheduler")
 DEFAULT_ENABLED_JOBS = ["contest_check"]
@@ -69,28 +69,29 @@ def _normalize_enabled_jobs(
 
 
 def load_group_configs() -> dict[int, GroupSchedulerConfig]:
-    """Load scheduler configs. Creates a default for CURRENT_GROUP if missing."""
+    """Load scheduler configs, adding defaults for every configured service group."""
     path = _config_path()
     if not os.path.exists(path):
-        # Default: the current group gets contest checks.
         cfg = get_config()
-        gid = cfg.current_group
+        group_ids = configured_group_ids(cfg)
         defaults = {
-            str(gid): {
-                "group_id": gid,
+            str(group_id): {
+                "group_id": group_id,
                 "enabled_jobs": DEFAULT_ENABLED_JOBS,
             }
+            for group_id in group_ids
         }
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(defaults, f, indent=2, ensure_ascii=False)
         return {
-            gid: GroupSchedulerConfig(
-                group_id=gid,
+            group_id: GroupSchedulerConfig(
+                group_id=group_id,
                 enabled_jobs=list(DEFAULT_ENABLED_JOBS),
             )
+            for group_id in group_ids
         }
 
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     result = {}
     for key, val in data.items():
@@ -106,11 +107,12 @@ def load_group_configs() -> dict[int, GroupSchedulerConfig]:
             job_schedules=val.get("job_schedules", {}),
         )
     cfg = get_config()
-    if cfg.current_group not in result:
-        result[cfg.current_group] = GroupSchedulerConfig(
-            group_id=cfg.current_group,
-            enabled_jobs=list(DEFAULT_ENABLED_JOBS),
-        )
+    for group_id in configured_group_ids(cfg):
+        if group_id not in result:
+            result[group_id] = GroupSchedulerConfig(
+                group_id=group_id,
+                enabled_jobs=list(DEFAULT_ENABLED_JOBS),
+            )
     return result
 
 
@@ -168,7 +170,8 @@ async def scheduler_loop(
             now = datetime.now(TZ)
             cfg = get_config()
 
-            await _run_jobs_for_group(cfg.current_group, now)
+            for group_id in configured_group_ids(cfg):
+                await _run_jobs_for_group(group_id, now)
 
         except Exception as e:
             logger.error(f"Scheduler loop error: {e}")

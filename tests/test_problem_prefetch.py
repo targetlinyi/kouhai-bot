@@ -153,6 +153,56 @@ def test_ready_slot_survives_coordinator_recreation(tmp_path, monkeypatch):
     assert prepare.await_count == 1
 
 
+def test_group_ready_claims_and_persisted_slots_are_independent(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch)
+    first_prepare = AsyncMock(return_value=_prepared("542D"))
+    second_prepare = AsyncMock(return_value=_prepared("100A"))
+
+    async def run():
+        first = NextProblemPrefetcher(123, prepare=first_prepare)
+        second = NextProblemPrefetcher(456, prepare=second_prepare)
+        first_slot, second_slot = await asyncio.gather(first._ensure_ready(), second._ensure_ready())
+        assert first.slot_path != second.slot_path
+        claimed = await first.claim()
+        assert claimed.slot_id == first_slot.slot_id
+        assert not first.slot_path.exists()
+        assert (await second.peek()).slot_id == second_slot.slot_id
+        restored = NextProblemPrefetcher(456, prepare=AsyncMock(side_effect=AssertionError("must reuse own slot")))
+        assert (await restored.peek()).slot_id == second_slot.slot_id
+        claimed_second = await second.claim()
+        assert claimed_second.problem.pid == "100A"
+        await second.release(claimed_second.slot_id)
+        assert first._claimed_slot_id == claimed.slot_id
+        await first.release(claimed.slot_id)
+        await asyncio.gather(first.shutdown(), second.shutdown(), restored.shutdown())
+
+    asyncio.run(run())
+    first_prepare.assert_awaited_once_with(123)
+    second_prepare.assert_awaited_once_with(456)
+
+
+def test_other_groups_current_or_solved_problem_does_not_invalidate_ready(tmp_path, monkeypatch):
+    _configure(tmp_path, monkeypatch)
+    current = {}
+    solved = {}
+    monkeypatch.setattr(problem_prefetch, "get_today_problem", lambda group_id: current.get(group_id))
+    monkeypatch.setattr(problem_prefetch, "load_scoreboard", lambda group_id: {"solves": solved.get(group_id, [])})
+
+    async def run():
+        first = NextProblemPrefetcher(123, prepare=AsyncMock(return_value=_prepared()))
+        second = NextProblemPrefetcher(456, prepare=AsyncMock(return_value=_prepared()))
+        await asyncio.gather(first._ensure_ready(), second._ensure_ready())
+        current[123] = {"today": "542D"}
+        solved[123] = [{"problem": "542D"}]
+        assert await first.peek() is None
+        assert (await second.peek()).problem.pid == "542D"
+        solved[456] = [{"problem": "542D"}]
+        assert await second.peek() is None
+        await asyncio.gather(first.shutdown(), second.shutdown())
+
+    asyncio.run(run())
+
+
 def test_claim_blocks_refill_until_release(tmp_path, monkeypatch):
     _configure(tmp_path, monkeypatch)
     second_started = asyncio.Event()

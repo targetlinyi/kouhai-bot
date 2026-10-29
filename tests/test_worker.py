@@ -104,3 +104,90 @@ def test_worker_owns_next_problem_prefetch_lifecycle(monkeypatch):
     prefetcher.set_ready_observer.assert_called_once_with(
         worker.ensure_editorial_prefetch,
     )
+
+
+def test_worker_starts_prefetch_lifecycle_for_every_configured_group(monkeypatch):
+    group_ids = [123, 456]
+    started: list[int] = []
+    stopped: list[int] = []
+    all_started = asyncio.Event()
+
+    class FakeNapCat:
+        def __init__(self, *, on_event):
+            self.on_event = on_event
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+    async def wait_for_stop(*, stop_event):
+        await stop_event.wait()
+
+    prefetchers = {}
+    for group_id in group_ids:
+        async def run_prefetch(*, stop_event, _group_id=group_id):
+            started.append(_group_id)
+            if len(started) == len(group_ids):
+                all_started.set()
+            await stop_event.wait()
+            stopped.append(_group_id)
+
+        prefetchers[group_id] = SimpleNamespace(
+            run=run_prefetch,
+            peek_pid=AsyncMock(return_value=f"{group_id}A"),
+            shutdown=AsyncMock(),
+            set_ready_observer=MagicMock(),
+        )
+
+    editorial_groups: list[int] = []
+    editorial_stopped: list[int] = []
+
+    async def run_editorial(
+        group_id,
+        *,
+        get_next_problem_pid,
+        stop_event,
+    ):
+        editorial_groups.append(group_id)
+        assert await get_next_problem_pid() == f"{group_id}A"
+        await stop_event.wait()
+        editorial_stopped.append(group_id)
+
+    cfg = SimpleNamespace(current_group=group_ids[0], current_groups=group_ids)
+    monkeypatch.setattr(worker, "get_config", lambda: cfg)
+    monkeypatch.setattr(worker, "NapCatServer", FakeNapCat)
+    monkeypatch.setattr(worker, "bootstrap_runtime", lambda: None)
+    monkeypatch.setattr(worker, "scheduler_loop", wait_for_stop)
+    monkeypatch.setattr(worker, "doubt_friend_request_loop", wait_for_stop)
+    monkeypatch.setattr(worker, "editorial_prefetch_maintenance_loop", run_editorial)
+    monkeypatch.setattr(
+        worker,
+        "get_next_problem_prefetcher",
+        lambda group_id: prefetchers[group_id],
+    )
+
+    async def run():
+        runtime = worker.WorkerRuntime()
+        monkeypatch.setattr(runtime, "_install_signal_handlers", lambda: None)
+        monkeypatch.setattr(runtime, "_wait_for_background_tasks", AsyncMock())
+        task = asyncio.create_task(runtime.run())
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        runtime._shutdown.set()
+        await asyncio.wait_for(task, timeout=1)
+        assert len(runtime._problem_prefetch_tasks) == len(group_ids)
+        assert len(runtime._editorial_prefetch_tasks) == len(group_ids)
+        assert all(task.done() for task in runtime._problem_prefetch_tasks + runtime._editorial_prefetch_tasks)
+
+    asyncio.run(run())
+
+    assert sorted(started) == sorted(group_ids)
+    assert sorted(stopped) == sorted(group_ids)
+    assert sorted(editorial_groups) == sorted(group_ids)
+    assert sorted(editorial_stopped) == sorted(group_ids)
+    for prefetcher in prefetchers.values():
+        prefetcher.shutdown.assert_awaited_once()
+        prefetcher.set_ready_observer.assert_called_once_with(
+            worker.ensure_editorial_prefetch,
+        )

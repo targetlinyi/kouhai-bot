@@ -207,6 +207,43 @@ def test_provider_extra_body_must_be_mapping(monkeypatch, tmp_path):
 def test_current_group_loaded(monkeypatch, tmp_path):
     cfg = _from_yaml(_make_yaml(current_group=123456), monkeypatch, tmp_path)
     assert cfg.current_group == 123456
+    assert cfg.current_groups == [123456]
+
+
+def test_current_groups_loaded_and_primary_group_is_first(monkeypatch, tmp_path):
+    data = yaml.safe_load(_make_yaml())
+    del data["current_group"]
+    data["current_groups"] = [123456, "789012", 123456]
+
+    cfg = _from_yaml(yaml.dump(data), monkeypatch, tmp_path)
+
+    assert cfg.current_groups == [123456, 789012]
+    assert cfg.current_group == 123456
+
+
+@pytest.mark.parametrize(
+    "current_groups",
+    [[], "123456", [0], [-1], [True], [1.5], ["bad"]],
+)
+def test_current_groups_rejects_invalid_values(
+    current_groups,
+    monkeypatch,
+    tmp_path,
+):
+    data = yaml.safe_load(_make_yaml())
+    del data["current_group"]
+    data["current_groups"] = current_groups
+
+    with pytest.raises(RuntimeError, match="current_groups|group id"):
+        _from_yaml(yaml.dump(data), monkeypatch, tmp_path)
+
+
+def test_current_group_and_current_groups_are_mutually_exclusive(monkeypatch, tmp_path):
+    data = yaml.safe_load(_make_yaml())
+    data["current_groups"] = [123456, 789012]
+
+    with pytest.raises(RuntimeError, match="either current_group or current_groups"):
+        _from_yaml(yaml.dump(data), monkeypatch, tmp_path)
 
 
 def test_submit_ac_backdoor_loaded(monkeypatch, tmp_path):

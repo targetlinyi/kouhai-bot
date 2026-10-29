@@ -11,7 +11,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
-from .config import get_config
+from .config import configured_group_ids, get_config
 from .napcat.client import send_group_msg
 
 logger = logging.getLogger("kouhai-bot.echo")
@@ -65,7 +65,7 @@ class GroupEcho:
         self.trigger_count = trigger_count
         self.echo_probability = echo_probability
         self._rng = rng
-        self._buffer: deque[EchoEntry] = deque(maxlen=max_entries)
+        self._buffers: dict[int, deque[EchoEntry]] = {}
         self._lock = asyncio.Lock()
 
     async def check_and_echo(
@@ -79,7 +79,7 @@ class GroupEcho:
     ) -> bool:
         """Record a group message and echo it when a repeat streak triggers."""
         cfg = get_config()
-        if group_id != cfg.current_group:
+        if group_id not in configured_group_ids(cfg):
             return False
         if not segments:
             return False
@@ -90,7 +90,10 @@ class GroupEcho:
 
         echo_segments: list[dict] | None = None
         async with self._lock:
-            buf = self._buffer
+            buf = self._buffers.setdefault(
+                group_id,
+                deque(maxlen=self.max_entries),
+            )
             stored_segments = _clone_segments(segments)
             buf.append(EchoEntry(
                 user_id=user_id,
@@ -130,9 +133,13 @@ class GroupEcho:
         await send_group_msg(group_id, echo_segments)
         return True
 
-    def buffer_snapshot(self) -> list[EchoEntry]:
+    def buffer_snapshot(self, group_id: int | None = None) -> list[EchoEntry]:
         """Return a copy of the buffer for tests and diagnostics."""
-        return list(self._buffer)
+        if group_id is None:
+            if len(self._buffers) == 1:
+                return list(next(iter(self._buffers.values())))
+            group_id = get_config().current_group
+        return list(self._buffers.get(group_id, ()))
 
 
 _echo = GroupEcho()
