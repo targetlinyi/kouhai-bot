@@ -296,3 +296,49 @@ def test_process_event_hooks_echo_for_face_only_group_messages():
     asyncio.run(_run())
 
     assert sent == [(_TestConfig.current_group, message)]
+
+
+def test_repeat_buffers_are_isolated_between_service_groups():
+    second_group = 654321
+    echo = GroupEcho(rng=lambda: 0.0)
+    sent: list[tuple[int, list[dict]]] = []
+
+    class MultiGroupConfig:
+        bot_qq = BOT_QQ
+        current_group = _TestConfig.current_group
+        current_groups = [_TestConfig.current_group, second_group]
+
+    async def _send_group_msg(group_id: int, message: list[dict]):
+        sent.append((group_id, message))
+        return len(sent)
+
+    async def _run():
+        with patch("kouhai_bot.config._config", MultiGroupConfig()), \
+                patch("kouhai_bot.echo.send_group_msg", _send_group_msg):
+            await echo.check_and_echo(
+                group_id=_TestConfig.current_group,
+                user_id=1,
+                segments=ECHO_MESSAGE,
+                raw_text="复读",
+                message_id="a1",
+            )
+            await echo.check_and_echo(
+                group_id=second_group,
+                user_id=2,
+                segments=ECHO_MESSAGE,
+                raw_text="复读",
+                message_id="b1",
+            )
+            await echo.check_and_echo(
+                group_id=_TestConfig.current_group,
+                user_id=3,
+                segments=ECHO_MESSAGE,
+                raw_text="复读",
+                message_id="a2",
+            )
+
+    asyncio.run(_run())
+
+    assert sent == [(_TestConfig.current_group, ECHO_MESSAGE)]
+    assert len(echo.buffer_snapshot(_TestConfig.current_group)) == 3
+    assert len(echo.buffer_snapshot(second_group)) == 1

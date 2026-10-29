@@ -9,7 +9,7 @@ import unicodedata
 
 from . import registry
 from .registry import CommandDef
-from ..config import get_config
+from ..config import configured_group_ids, get_config
 from .. import echo
 from ..friend_requests import handle_friend_request_event, is_service_group_member
 from .notice import handle_notice_event
@@ -142,8 +142,8 @@ async def process_event(
     if str(user_id) == str(cfg.bot_qq):
         return
 
-    # The bot serves exactly one configured group.
-    if msg_type == "group" and group_id != cfg.current_group:
+    service_group_ids = configured_group_ids(cfg)
+    if msg_type == "group" and group_id not in service_group_ids:
         return
     if msg_type == "private":
         group_id = cfg.current_group
@@ -187,11 +187,17 @@ async def process_event(
                 "这个命令暂时只能在服务群里使用～private judge 可用 /help 查看支持的命令。"
             ))
             return
-        if not await is_service_group_member(group_id, user_id):
+        member_group_id = None
+        for service_group_id in service_group_ids:
+            if await is_service_group_member(service_group_id, user_id):
+                member_group_id = service_group_id
+                break
+        if member_group_id is None:
             await send_private_msg(user_id, build_plain_message(
-                "private judge 目前只服务当前服务群成员。如果你已经在群里，稍后再试试。"
+                "private judge 目前只服务已配置的服务群成员。如果你已经在群里，稍后再试试。"
             ))
             return
+        group_id = member_group_id
 
     if cmd_def.handler is None:
         logger.warning(f"Command '{cmd_name}' has no handler")

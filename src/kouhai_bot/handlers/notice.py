@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from ..config import get_config
+from ..config import configured_group_ids, get_config
 from ..napcat.client import send_group_poke
 
 logger = logging.getLogger("kouhai-bot.notice")
@@ -19,7 +19,7 @@ async def handle_notice_event(event: dict) -> None:
     group_id = event.get("group_id", 0)
     raw_user_id = event.get("user_id")
     target_id = event.get("target_id", 0)
-    if group_id != cfg.current_group or str(target_id) != str(cfg.bot_qq):
+    if group_id not in configured_group_ids(cfg) or str(target_id) != str(cfg.bot_qq):
         return
     if isinstance(raw_user_id, bool) or not isinstance(raw_user_id, (int, str)):
         return

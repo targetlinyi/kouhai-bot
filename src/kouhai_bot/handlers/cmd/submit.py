@@ -284,6 +284,11 @@ def _coordinator_key(group_id: int, *, scope: str = GROUP_SCOPE, user_id: int = 
     return (GROUP_SCOPE, int(group_id))
 
 
+def _history_key(req: PendingRequest, pid: str) -> tuple[str, int, int, str]:
+    # Private history is shared per user, regardless of the originating group.
+    return (req.scope, 0 if req.is_private else req.group_id, req.user_id, pid)
+
+
 def _get_coordinator(
     group_id: int,
     *,
@@ -737,7 +742,7 @@ class GroupCoordinator:
 
     async def _save_context_record(self, req: PendingRequest, record: dict) -> bool:
         async with self.lock:
-            key = (req.scope, req.group_id, req.user_id, str(record.get("problem", "") or ""))
+            key = _history_key(req, str(record.get("problem", "") or ""))
             if self.clear_watermarks.get(key, 0) >= req.seq:
                 return False
             if req.is_private:
@@ -1583,7 +1588,7 @@ class GroupCoordinator:
                 clear_private_problem_history(req.user_id, pid)
             else:
                 clear_user_problem_submissions(req.group_id, req.user_id, pid)
-            key = (req.scope, req.group_id, req.user_id, pid)
+            key = _history_key(req, pid)
             self.clear_watermarks[key] = max(self.clear_watermarks.get(key, 0), req.seq)
         await _react_req(req, "128076")
         self._log_finished(req, "ok", problem=pid)
@@ -1642,6 +1647,7 @@ async def enqueue_submit_request(
     submission: str,
     *,
     scope: str = GROUP_SCOPE,
+    private_problem: dict | None = None,
 ) -> str:
     coord = _get_coordinator(group_id, scope=scope, user_id=user_id)
     req: PendingRequest | None = None
@@ -1659,7 +1665,13 @@ async def enqueue_submit_request(
                     )
             problem = get_today_problem(group_id)
         else:
-            problem = get_private_current_problem(user_id)
+            # A group redirect keeps its original problem even if another
+            # group changes this user's private problem while messages send.
+            problem = (
+                dict(private_problem)
+                if private_problem is not None
+                else get_private_current_problem(user_id)
+            )
         submit_pid = problem.get("today", "") if problem else ""
         if scope == PRIVATE_SCOPE:
             already_solved = bool(
@@ -1830,6 +1842,7 @@ async def _redirect_blocked_group_submit_to_private(
         message_id,
         submission,
         scope=PRIVATE_SCOPE,
+        private_problem=problem,
     )
     return True
 

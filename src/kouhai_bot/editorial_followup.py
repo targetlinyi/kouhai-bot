@@ -12,7 +12,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable
 
-from .config import get_config
+from .config import configured_group_ids, get_config
 from .napcat.client import (
     build_node,
     build_plain_message,
@@ -159,9 +159,10 @@ def schedule_prefetch_for_group_today(group_id: int) -> None:
 
 
 def schedule_prefetch_for_current_group() -> None:
+    """Backward-compatible helper that covers every configured service group."""
     cfg = get_config()
-    if cfg.current_group:
-        schedule_prefetch_for_group_today(cfg.current_group)
+    for group_id in configured_group_ids(cfg):
+        schedule_prefetch_for_group_today(group_id)
 
 
 async def editorial_prefetch_maintenance_loop(

@@ -411,3 +411,40 @@ def test_non_poke_notice_is_ignored(monkeypatch):
     asyncio.run(process_event(_poke_event(sub_type="lucky_king"), spawn_handlers=False))
 
     assert pokes == []
+
+
+def test_bot_poke_in_second_service_group_is_handled(monkeypatch):
+    newproblem = _reset_newproblem_runtime()
+    second_group_id = GROUP_ID + 1
+    cfg = SimpleNamespace(
+        bot_qq=BOT_QQ,
+        current_group=GROUP_ID,
+        current_groups=[GROUP_ID, second_group_id],
+        newproblem_cooldown=300,
+    )
+    pokes = []
+    resends = []
+
+    async def fake_poke(group_id, user_id):
+        pokes.append((group_id, user_id))
+        return True
+
+    async def fake_resend(group_id, sender):
+        resends.append((group_id, sender))
+
+    monkeypatch.setattr("kouhai_bot.handlers.notice.get_config", lambda: cfg)
+    monkeypatch.setattr(newproblem, "get_config", lambda: cfg)
+    monkeypatch.setattr("kouhai_bot.handlers.notice.send_group_poke", fake_poke)
+    monkeypatch.setattr(newproblem, "has_unsolved_problem", lambda _gid: True)
+    monkeypatch.setattr(
+        "kouhai_bot.handlers.cmd.stubs.resend_current_problem_group",
+        fake_resend,
+    )
+
+    asyncio.run(process_event(
+        _poke_event(group_id=second_group_id),
+        spawn_handlers=False,
+    ))
+
+    assert pokes == [(second_group_id, USER_ID)]
+    assert resends == [(second_group_id, {"user_id": USER_ID})]

@@ -29,7 +29,7 @@ uv sync
 
 这个项目需要一个 QQ 账号，以及需要配置 NapCat 用于连接 QQ。目前 QQ 合法地允许同一个人（同一个身份证）拥有至多 5 个 QQ 账号，只需要正常注册即可。关于 NapCat，可参考 `DEPENDENCIES.md` 配置，或者直接寻求 AI 协助。
 
-> NapCat 可简单理解为能够将 QQ 变成 API，只需要发出 HTTP 请求就能完成 QQ 操作。NapCat 可以反向代理出多个端口。本项目假定一个 bot 实例对应于一个端口和一个群，bot 独占使用此端口。如果你想配多个bot实例服务于多个群聊，需要修改 NapCat 配置启用更多端口。每个bot实例独立工作，但关于群聊的上下文在`~/.kouhai-bot/`下全局保存。
+> NapCat 可简单理解为能够将 QQ 变成 API，只需要发出 HTTP 请求就能完成 QQ 操作。一个 bot 实例可以通过同一个 NapCat 连接服务多个群，不需要为每个群增加端口。各群的题目、积分、聊天记录和预取状态保存在 `data_dir/groups/<群号>/` 下，彼此独立；不同 bot 实例仍需使用不同的监听端口。
 
 ### 2. 配置
 
@@ -47,7 +47,7 @@ cp config.example.yaml config.yaml
 # ── QQ Bot ──
 # ── NapCat WebSocket (bot listens here, NapCat connects to this) ──
 ```
-写入 bot 的 QQ 号和你的 NapCat 配置。端口是每实例、每群聊唯一的。如果你不确定如何配置，寻求 AI 协助。
+写入 bot 的 QQ 号和你的 NapCat 配置。每个实例独占自己的监听端口，同一实例服务的多个群共用这套连接。
 
 #### LLM 服务
 
@@ -89,7 +89,23 @@ Bot 根据任务类型路由到两个模型队列：
 # ── Group ──
 ```
 
-配置群号。
+单群可以继续使用 `current_group`，将占位符替换为实际群号：
+
+```yaml
+current_group: "<service_group_id>"
+```
+
+同时服务多个群时，删除 `current_group`，改为有序列表：
+
+```yaml
+current_groups:
+  - "<primary_group_id>"
+  - "<another_group_id>"
+```
+
+两个字段不能同时存在，列表不能为空，群号必须为正整数。第一项为主群。把同一个 bot 拉入这些群后，各群独立选题、计分和预取下一题，定时任务也按群配置。
+
+私聊时，bot 按列表顺序检查成员身份，选择第一个确认包含该用户的服务群；`/sp` 默认题目、私聊 `/sync` 和 `/testcd` 均使用该群。未确认属于任何服务群的用户不能使用私聊命令。私聊题目和记录仍按用户独立保存。
 
 #### 打星 
 
